@@ -1,0 +1,17 @@
+# Marcador CETis 120 — configuración de Netlify
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# la página se puede instalar como app; que el navegador siempre revise si hay versión nueva
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"

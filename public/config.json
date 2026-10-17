@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "logos": [ { "id": "dgeti", "name": "DGETI en tu comunidad", "type": "static", "file": "media/logo-dgeti.png", "default": true } ],
+  "banners": [ { "id": "cetis120", "name": "Franja CETis 120 Morelia", "type": "static", "file": "media/franja-cetis120.png", "default": true } ],
+  "music": []
+}

@@ -1,0 +1,9 @@
+{
+  "name": "marcador-cetis120",
+  "private": true,
+  "type": "module",
+  "description": "Marcador de fotos y videos del CETis 120 Morelia. Creado por Ricardo Daniel Muñoz Mora «Morita».",
+  "dependencies": {
+    "@netlify/blobs": "^8.1.0"
+  }
+}
