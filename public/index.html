@@ -141,7 +141,11 @@ main.mist{padding-block:clamp(56px,8vw,104px) clamp(80px,10vw,128px)}
 
 .work{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:16px;align-items:start}
 @media (max-width:880px){.work{grid-template-columns:minmax(0,1fr)}}
-.tile{background:var(--surface-card);border-radius:var(--radius-lg);box-shadow:var(--shadow-float);padding:clamp(20px,3vw,32px);display:grid;gap:20px;min-width:0}
+.tile{background:var(--surface-card);border-radius:var(--radius-lg);box-shadow:var(--shadow-float);padding:clamp(20px,3vw,32px);display:grid;grid-template-columns:minmax(0,1fr);gap:20px;min-width:0}
+.tile > *,.field > *,.tracks > *,.brandctl > *{min-width:0}
+.track{min-width:0}
+.track .t small,.note,.small-note{overflow-wrap:anywhere}
+.seg{flex-wrap:wrap}
 .sticky{position:sticky;top:calc(env(safe-area-inset-top,0px) + 20px)}
 @media (max-width:880px){.sticky{position:static}}
 .tile h2{font-size:clamp(26px,3vw,34px);display:flex;gap:10px;align-items:baseline}
@@ -1318,7 +1322,7 @@ $("#clearBtn").addEventListener("click", () => {
 });
 function say(msg, err){ toast.textContent = msg; toast.className = "toast" + (err ? " err" : ""); }
 
-brandReady.then(() => renderPreviews());
+brandReady.then(() => { renderPreviews(); edRenderMusic(); });
 if (FAST_VIDEO){ $("#modeChip").textContent = "Modo rápido · Nada se sube a internet"; }
 
 /* ---------- movimiento al estilo Apple ---------- */
@@ -1742,6 +1746,11 @@ function blackOverlay(ctx, vw, vh, a){ if (a <= 0) return; ctx.fillStyle = `rgba
 const fadeAlpha = (local, dur) => Math.max(0, 1 - Math.min(local, dur - local) / FADE_SEC);
 
 /* ---------- audio ---------- */
+function ascBytes(rate, ch){
+  const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+  const v = (2 << 11) | (Math.max(0, rates.indexOf(rate)) << 7) | (ch << 3);
+  return new Uint8Array([v >> 8, v & 255]);
+}
 async function pickAudioCodec(){
   if (typeof AudioEncoder !== "function") return null;
   for (const c of [{ codec: "mp4a.40.2", kind: "aac" }, { codec: "opus", kind: "opus" }]){
@@ -1957,17 +1966,36 @@ async function renderJoin(){
   } finally { try { encoder.close(); } catch(e){} }
 
   // 3) audio al MP4
+  let audioFrames = 0;
   if (audio){
-    if (audio.chunks) for (const [ch, m] of audio.chunks) muxer.addAudioChunk(ch, m);
-    else {
+    if (audio.chunks){
+      // No confiamos en los tiempos que da el codificador (en Windows pueden venir vacíos o desfasados):
+      // cada trozo AAC dura 1024 muestras; Opus usa su propia duración.
+      let desc = null;
+      for (const [, m] of audio.chunks) if (m && m.decoderConfig && m.decoderConfig.description){ desc = m.decoderConfig.description; break; }
+      const isAAC = audio.kind === "aac";
+      if (isAAC && !desc) desc = ascBytes(SR, 2);
+      const meta = { decoderConfig: { codec: isAAC ? "mp4a.40.2" : "opus", numberOfChannels: 2, sampleRate: SR, ...(desc ? { description: desc } : {}) } };
+      let t = 0;
+      for (const [ch] of audio.chunks){
+        let data = new Uint8Array(ch.byteLength); ch.copyTo(data);
+        if (isAAC && data.length > 9 && data[0] === 0xFF && (data[1] & 0xF6) === 0xF0) data = data.subarray((data[1] & 1) ? 7 : 9);   // quita cabecera ADTS
+        if (!data.length) continue;
+        const dur = isAAC ? 1024e6 / SR : (ch.duration > 0 ? ch.duration : 20000);
+        muxer.addAudioChunkRaw(data, "key", Math.round(t), Math.round(dur), meta);
+        t += dur; audioFrames++;
+      }
+    } else {
       const { at, asc, list } = audio.raw;
       const meta = { decoderConfig: { codec: "mp4a.40.2", numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate, description: asc } };
-      for (const a of list) muxer.addAudioChunkRaw(a.data, "key", Math.round(a.cts * 1e6 / a.timescale), Math.round(a.duration * 1e6 / a.timescale), meta);
+      for (const a of list){ muxer.addAudioChunkRaw(a.data, "key", Math.round(a.cts * 1e6 / a.timescale), Math.round(a.duration * 1e6 / a.timescale), meta); audioFrames++; }
     }
   }
   muxer.finalize();
   freeCanvas(c); freeCanvas(logoC);
-  return { blob: new Blob([muxer.target.buffer], { type: "video/mp4" }), warn: plan.warn, total };
+  if (needAudio && !audioFrames && !plan.warn) plan.warn = "El navegador no entregó el audio; el video salió sin sonido. Prueba en Chrome o Edge actualizados.";
+  const audioNote = !needAudio ? "sin audio" : audioFrames ? (audio.kind === "aac" ? "audio AAC" : "audio Opus") : "sin audio";
+  return { blob: new Blob([muxer.target.buffer], { type: "video/mp4" }), warn: plan.warn, total, audioNote };
 }
 
 $("#edMake").addEventListener("click", async () => {
@@ -1982,7 +2010,7 @@ $("#edMake").addEventListener("click", async () => {
     ED.result = { blob: r.blob, outName: name, url: URL.createObjectURL(r.blob) };
     $("#edOut").src = ED.result.url;
     $("#edResult").hidden = false;
-    edSet(1, `Listo: ${fmtTime(r.total)} · ${fmtSize(r.blob.size)}${r.warn ? ". " + r.warn : ""}`);
+    edSet(1, `Listo: ${fmtTime(r.total)} · ${fmtSize(r.blob.size)} · ${r.audioNote}${r.warn ? ". " + r.warn : ""}`);
   } catch(err){
     console.error(err);
     edSet(0, err && err.userMsg ? err.userMsg : "No se pudo armar el video. Prueba con menos videos o en una computadora.");
