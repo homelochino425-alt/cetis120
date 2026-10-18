@@ -1769,7 +1769,10 @@ function framesFromChunks(chunks, kind){
   const isAAC = kind === "aac";
   let desc = null;
   for (const [, m] of chunks) if (m && m.decoderConfig && m.decoderConfig.description){ desc = m.decoderConfig.description; break; }
-  if (isAAC && !desc) desc = ascBytes(SR, 2);
+  const encDescLen = desc ? desc.byteLength : 0;
+  // En Windows la "ficha" del AAC viene con 12 bytes extra (formato de Windows) y los reproductores no la entienden.
+  // Como configuramos AAC-LC a 48 kHz estéreo, la armamos nosotros siempre.
+  if (isAAC) desc = ascBytes(SR, 2);
   const frames = []; let t = 0;
   for (const [ch] of chunks){
     let data = new Uint8Array(ch.byteLength); ch.copyTo(data);
@@ -1778,7 +1781,7 @@ function framesFromChunks(chunks, kind){
     const dur = isAAC ? 1024e6 / SR : (ch.duration > 0 ? ch.duration : 20000);
     frames.push({ data, ts: Math.round(t), dur: Math.round(dur) }); t += dur;
   }
-  return { kind, frames, desc };
+  return { kind, frames, desc, encDescLen };
 }
 // decodifica lo que salió para comprobar que de verdad suena (null = no se pudo revisar)
 async function audioLevel(a){
@@ -1937,7 +1940,7 @@ async function renderJoin(){
       a.level = lvl;
       // si la mezcla suena pero lo codificado sale mudo, probamos el siguiente códec
       if (lvl !== null && lvl >= 0 && plan.mixLevel >= 1e-3 && lvl < plan.mixLevel * 0.05){ notes.push(codec.kind.toUpperCase() + " salió mudo"); continue; }
-      if (lvl === -1){ notes.push(codec.kind.toUpperCase() + " no se pudo revisar"); }
+      if (lvl === -1){ notes.push(codec.kind.toUpperCase() + " no se pudo leer" + (a.encDescLen ? ` (ficha ${a.encDescLen} B)` : "")); continue; }
       audio = a; break;
     }
     if (!audio){
