@@ -1751,6 +1751,59 @@ function ascBytes(rate, ch){
   const v = (2 << 11) | (Math.max(0, rates.indexOf(rate)) << 7) | (ch << 3);
   return new Uint8Array([v >> 8, v & 255]);
 }
+function rmsOf(buf){
+  let s = 0, n = 0;
+  for (let c = 0; c < buf.numberOfChannels; c++){ const d = buf.getChannelData(c); for (let i = 0; i < d.length; i += 97){ s += d[i] * d[i]; n++; } }
+  return Math.sqrt(s / Math.max(1, n));
+}
+async function audioCodecs(){
+  const out = [];
+  if (typeof AudioEncoder !== "function") return out;
+  for (const c of [{ codec: "mp4a.40.2", kind: "aac" }, { codec: "opus", kind: "opus" }]){
+    try { const r = await AudioEncoder.isConfigSupported({ codec: c.codec, sampleRate: SR, numberOfChannels: 2, bitrate: 160000 }); if (r && r.supported) out.push(c); } catch(e){}
+  }
+  return out;
+}
+// pasa los trozos del codificador a tramas con tiempos calculados por nosotros
+function framesFromChunks(chunks, kind){
+  const isAAC = kind === "aac";
+  let desc = null;
+  for (const [, m] of chunks) if (m && m.decoderConfig && m.decoderConfig.description){ desc = m.decoderConfig.description; break; }
+  if (isAAC && !desc) desc = ascBytes(SR, 2);
+  const frames = []; let t = 0;
+  for (const [ch] of chunks){
+    let data = new Uint8Array(ch.byteLength); ch.copyTo(data);
+    if (isAAC && data.length > 9 && data[0] === 0xFF && (data[1] & 0xF6) === 0xF0) data = data.subarray((data[1] & 1) ? 7 : 9);   // quita cabecera ADTS
+    if (!data.length) continue;
+    const dur = isAAC ? 1024e6 / SR : (ch.duration > 0 ? ch.duration : 20000);
+    frames.push({ data, ts: Math.round(t), dur: Math.round(dur) }); t += dur;
+  }
+  return { kind, frames, desc };
+}
+// decodifica lo que salió para comprobar que de verdad suena (null = no se pudo revisar)
+async function audioLevel(a){
+  if (typeof AudioDecoder !== "function") return null;
+  const cfg = { codec: a.kind === "aac" ? "mp4a.40.2" : "opus", sampleRate: SR, numberOfChannels: 2 };
+  if (a.desc) cfg.description = a.desc;
+  try { const r = await AudioDecoder.isConfigSupported(cfg); if (!r || !r.supported) return null; } catch(e){ return null; }
+  let s = 0, n = 0, err = null;
+  const dec = new AudioDecoder({ output: ad => {
+    try { const len = ad.numberOfFrames, tmp = new Float32Array(len); ad.copyTo(tmp, { planeIndex: 0, format: "f32-planar" }); for (let i = 0; i < len; i += 31){ s += tmp[i] * tmp[i]; n++; } } catch(e){}
+    ad.close();
+  }, error: e => { err = e; } });
+  try {
+    dec.configure(cfg);
+    for (const f of a.frames){
+      dec.decode(new EncodedAudioChunk({ type: "key", timestamp: f.ts, duration: f.dur, data: f.data }));
+      if (dec.decodeQueueSize > 40) await yieldUI();
+      if (err) break;
+    }
+    await dec.flush();
+  } catch(e){ err = err || e; }
+  try { dec.close(); } catch(e){}
+  if (err || !n) return -1;
+  return Math.sqrt(s / n);
+}
 async function pickAudioCodec(){
   if (typeof AudioEncoder !== "function") return null;
   for (const c of [{ codec: "mp4a.40.2", kind: "aac" }, { codec: "opus", kind: "opus" }]){
@@ -1871,12 +1924,27 @@ async function renderJoin(){
   if (needAudio){
     const st = s => edSet(0.02, s);
     const mixed = await mixAudio(plan, st);
-    const codec = await pickAudioCodec();
-    if (codec){ st("Codificando el audio…"); audio = { kind: codec.kind, chunks: await encodeAudio(mixed, codec) }; }
-    else {
+    plan.mixLevel = rmsOf(mixed);
+    if (plan.mixLevel < 1e-4) plan.warn = "La música y el sonido de los videos quedaron en silencio al mezclarse (no se pudieron leer).";
+    const notes = [];
+    for (const codec of await audioCodecs()){
+      st(`Codificando el audio (${codec.kind.toUpperCase()})…`);
+      let a;
+      try { a = framesFromChunks(await encodeAudio(mixed, codec), codec.kind); } catch(e){ console.warn(e); notes.push(codec.kind.toUpperCase() + " falló"); continue; }
+      if (!a.frames.length){ notes.push(codec.kind.toUpperCase() + " no entregó audio"); continue; }
+      st("Revisando que el audio suene…");
+      const lvl = await audioLevel(a);
+      a.level = lvl;
+      // si la mezcla suena pero lo codificado sale mudo, probamos el siguiente códec
+      if (lvl !== null && lvl >= 0 && plan.mixLevel >= 1e-3 && lvl < plan.mixLevel * 0.05){ notes.push(codec.kind.toUpperCase() + " salió mudo"); continue; }
+      if (lvl === -1){ notes.push(codec.kind.toUpperCase() + " no se pudo revisar"); }
+      audio = a; break;
+    }
+    if (!audio){
       const r = await recordAudioAAC(mixed, st).catch(e => { console.warn(e); return null; });
       if (r) audio = { kind: "aac", raw: r }; else plan.warn = "Tu navegador no pudo guardar el audio; el video sale sin sonido.";
     }
+    plan.audioNotes = notes;
   }
 
   // 2) video
@@ -1968,23 +2036,10 @@ async function renderJoin(){
   // 3) audio al MP4
   let audioFrames = 0;
   if (audio){
-    if (audio.chunks){
-      // No confiamos en los tiempos que da el codificador (en Windows pueden venir vacíos o desfasados):
-      // cada trozo AAC dura 1024 muestras; Opus usa su propia duración.
-      let desc = null;
-      for (const [, m] of audio.chunks) if (m && m.decoderConfig && m.decoderConfig.description){ desc = m.decoderConfig.description; break; }
-      const isAAC = audio.kind === "aac";
-      if (isAAC && !desc) desc = ascBytes(SR, 2);
-      const meta = { decoderConfig: { codec: isAAC ? "mp4a.40.2" : "opus", numberOfChannels: 2, sampleRate: SR, ...(desc ? { description: desc } : {}) } };
-      let t = 0;
-      for (const [ch] of audio.chunks){
-        let data = new Uint8Array(ch.byteLength); ch.copyTo(data);
-        if (isAAC && data.length > 9 && data[0] === 0xFF && (data[1] & 0xF6) === 0xF0) data = data.subarray((data[1] & 1) ? 7 : 9);   // quita cabecera ADTS
-        if (!data.length) continue;
-        const dur = isAAC ? 1024e6 / SR : (ch.duration > 0 ? ch.duration : 20000);
-        muxer.addAudioChunkRaw(data, "key", Math.round(t), Math.round(dur), meta);
-        t += dur; audioFrames++;
-      }
+    if (audio.frames){
+      // tiempos calculados por nosotros (en Windows el codificador puede darlos vacíos o desfasados)
+      const meta = { decoderConfig: { codec: audio.kind === "aac" ? "mp4a.40.2" : "opus", numberOfChannels: 2, sampleRate: SR, ...(audio.desc ? { description: audio.desc } : {}) } };
+      for (const f of audio.frames){ muxer.addAudioChunkRaw(f.data, "key", f.ts, f.dur, meta); audioFrames++; }
     } else {
       const { at, asc, list } = audio.raw;
       const meta = { decoderConfig: { codec: "mp4a.40.2", numberOfChannels: at.audio.channel_count, sampleRate: at.audio.sample_rate, description: asc } };
@@ -1994,7 +2049,15 @@ async function renderJoin(){
   muxer.finalize();
   freeCanvas(c); freeCanvas(logoC);
   if (needAudio && !audioFrames && !plan.warn) plan.warn = "El navegador no entregó el audio; el video salió sin sonido. Prueba en Chrome o Edge actualizados.";
-  const audioNote = !needAudio ? "sin audio" : audioFrames ? (audio.kind === "aac" ? "audio AAC" : "audio Opus") : "sin audio";
+  const pct = x => Math.min(100, Math.round(x * 300)) + "%";
+  let audioNote = !needAudio ? "sin audio" : audioFrames ? (audio.kind === "aac" ? "audio AAC" : "audio Opus") : "sin audio";
+  if (needAudio){
+    const bits = [];
+    if (plan.mixLevel != null) bits.push("mezcla " + pct(plan.mixLevel));
+    if (audio && audio.level != null && audio.level >= 0) bits.push("revisado " + pct(audio.level));
+    if (plan.audioNotes && plan.audioNotes.length) bits.push(plan.audioNotes.join(", "));
+    if (bits.length) audioNote += " (" + bits.join(" · ") + ")";
+  }
   return { blob: new Blob([muxer.target.buffer], { type: "video/mp4" }), warn: plan.warn, total, audioNote };
 }
 
